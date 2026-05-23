@@ -11,7 +11,17 @@
 
 set -euo pipefail
 
-DEVICE="/dev/disk4s2"
+# Auto-detect NTFS device (Seagate 8TB)
+DEVICE="${NTFS_DEVICE:-}"
+if [ -z "$DEVICE" ]; then
+    DEVICE=$(diskutil list external 2>/dev/null | grep -i "Windows_NTFS\|Microsoft Basic Data" | awk '{print $NF}' | head -1)
+    if [ -n "$DEVICE" ]; then
+        DEVICE="/dev/$DEVICE"
+    else
+        echo "ERROR: No external NTFS partition found. Set NTFS_DEVICE=/dev/diskXsY manually."
+        exit 1
+    fi
+fi
 EXCLUSION="/Users/zenray/tmp_d_img/exclusion_list.txt"
 STAGING="/Users/zenray/tmp_d_img/recovery2_staged"
 SCAN_OUT="/Users/zenray/tmp_d_img/recovery2_scan.txt"
@@ -51,9 +61,12 @@ log "Step 2: Scanning MFT for deleted media files..."
 log "  This may take 5-15 minutes on 8TB..."
 
 # ntfsundelete -s scans and lists deleted files
+# -P = show percentage, -m '*' = match all filenames, -f = force (hibernated partition)
 # Output format: Inode  Flags  %age  Date  Time  Size  Filename
-/usr/local/bin/ntfsundelete "$DEVICE" -s -f -p 0 2>/dev/null | \
-    grep -iE '\.(png|jpg|jpeg|webp|gif|bmp|mp4|webm)$' > "$SCAN_OUT" || true
+log "  Running: ntfsundelete $DEVICE -s -P -p 0 -m '*' -f"
+/usr/local/bin/ntfsundelete "$DEVICE" -s -P -p 0 -m '*' -f 2>&1 | tee "$SCAN_OUT.raw" | \
+    grep -iE '\.(png|jpg|jpeg|webp|gif|bmp|mp4|webm)' > "$SCAN_OUT" || true
+log "  Raw scan output: $(wc -l < "$SCAN_OUT.raw") lines"
 
 TOTAL_DELETED=$(wc -l < "$SCAN_OUT")
 log "  Found $TOTAL_DELETED deleted media files"
