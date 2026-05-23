@@ -1,37 +1,63 @@
 #!/bin/bash
 # LaunchImportRecoveredDiskToEagle.command
-# Double-cliquer pour lancer le pipeline depuis Terminal.app (Full Disk Access requis)
+# Ouvrir depuis Finder (Terminal.app FDA requis pour raw device + NTFS)
 
 set -e
 cd "$(dirname "$0")"
 
-# Mount /Volumes/d if not already mounted
-if ! mount | grep -q "/Volumes/d"; then
-    echo "[*] Mounting /dev/disk4s2 → /Volumes/d ..."
-    diskutil mount /dev/disk4s2
-    sleep 2
-fi
+DEVICE=/dev/disk4s2
+MOUNT=/Volumes/d
+NTFS3G=/opt/homebrew/bin/ntfs-3g
+LOG=/Users/zenray/NTFS_Recovery_ntfsundelete/tmp_disk_pipeline/pipeline.log
 
-# Verify source exists
-if [ ! -d "/Volumes/d/SS_VideoGames/A_Trier/_RECOVERED" ]; then
-    echo "[ERROR] /Volumes/d/SS_VideoGames/A_Trier/_RECOVERED not found!"
-    echo "  Vérifier que le dossier existe sur le disque."
-    read -p "Appuyer sur Entrée pour quitter..."
+echo "═══════════════════════════════════════════"
+echo "  _RECOVERED → Eagle  PIPELINE LAUNCHER"
+echo "═══════════════════════════════════════════"
+
+# 1. Monter en read-write via ntfs-3g si nécessaire (nécessite Terminal.app FDA)
+if mount | grep -q "$DEVICE.*macfuse"; then
+    echo "[*] $DEVICE est déjà monté via macFUSE/ntfs-3g."
+elif mount | grep -q "$DEVICE"; then
+    echo "[*] Démontage mount natif read-only..."
+    diskutil unmount "$DEVICE" || diskutil unmount force "$DEVICE"
+    sleep 1
+    echo "[*] Montage ntfs-3g read-write sur $MOUNT ..."
+    mkdir -p "$MOUNT"
+    sudo "$NTFS3G" "$DEVICE" "$MOUNT" \
+        -o local,allow_other,auto_xattr,auto_cache,noatime,windows_names,streams_interface=openxattr,inherit,uid="$(id -u)",gid="$(id -g)",big_writes,remove_hiberfile
+else
+    echo "[*] Montage ntfs-3g read-write sur $MOUNT ..."
+    mkdir -p "$MOUNT"
+    sudo "$NTFS3G" "$DEVICE" "$MOUNT" \
+        -o local,allow_other,auto_xattr,auto_cache,noatime,windows_names,streams_interface=openxattr,inherit,uid="$(id -u)",gid="$(id -g)",big_writes,remove_hiberfile
+fi
+echo "[*] Montage OK — vérification accès..."
+
+# 3. Vérifier le dossier sans pré-scan coûteux.
+# Le script Python fait son propre scan et logge le nombre de fichiers.
+if [ ! -d "$MOUNT/SS_VideoGames/A_Trier/_RECOVERED" ]; then
+    echo "[ERROR] Dossier introuvable : $MOUNT/SS_VideoGames/A_Trier/_RECOVERED"
     exit 1
 fi
+echo "[*] Dossier _RECOVERED présent. Scan détaillé confié au pipeline Python."
 
+# 4. Lancer le pipeline
 mkdir -p /Users/zenray/NTFS_Recovery_ntfsundelete/tmp_disk_pipeline
-
-echo "[*] Starting ImportRecoveredDiskToEagle.py ..."
-echo "[*] Log: /Users/zenray/NTFS_Recovery_ntfsundelete/tmp_disk_pipeline/pipeline.log"
+echo ""
+echo "[*] Lancement ImportRecoveredDiskToEagle.py ..."
+echo "[*] Log : $LOG"
 echo ""
 
+export DELETE_SOURCE_AFTER_IMPORT=1
+export EAGLE_COPY_GRACE_SECONDS=180
+
 nohup python3 /Users/zenray/Create/Build/Memory/Tools/Recovery/ImportRecoveredDiskToEagle.py \
-    >> /Users/zenray/NTFS_Recovery_ntfsundelete/tmp_disk_pipeline/pipeline.log 2>&1 &
+    >> "$LOG" 2>&1 &
 
 PID=$!
 echo "[*] PID: $PID"
-echo "[*] Pour suivre la progression:"
-echo "    tail -f /Users/zenray/NTFS_Recovery_ntfsundelete/tmp_disk_pipeline/pipeline.log"
 echo ""
-echo "Process lancé en arrière-plan. Cette fenêtre peut être fermée."
+echo "[*] Suivre la progression :"
+echo "    tail -f $LOG"
+echo ""
+echo "Pipeline lancé. Cette fenêtre peut être fermée."

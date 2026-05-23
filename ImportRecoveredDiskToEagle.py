@@ -9,7 +9,7 @@ Importe les fichiers de /Volumes/d/SS_VideoGames/A_Trier/_RECOVERED vers Eagle G
 - Images  → AVIF CRF25 → Eagle addFromPaths
 - Vidéos  → frames ffmpeg 1/10s cap 50 → AVIF CRF25 → Eagle addFromPaths
 - 16 workers ProcessPoolExecutor
-- NTFS read-only : jamais de suppression de la source
+- NTFS read-write : suppression de la source après acceptation Eagle
 - Classsification par nom de fichier (SortByGame.py + EXTRA_PATTERNS)
 - Folder dedup via GET /api/folder/list au démarrage
 """
@@ -30,6 +30,8 @@ WORKERS       = 16
 GAMES_ROOT_ID = "MIOUGBL8AF4E4"
 FRAMES_CAP    = 50
 SORT_BY_GAME  = Path("/Users/zenray/Create/Build/Memory/Tools/Recovery/SortByGame.py")
+DELETE_SOURCE_AFTER_IMPORT = os.environ.get("DELETE_SOURCE_AFTER_IMPORT", "1").lower() not in {"0", "false", "no"}
+EAGLE_COPY_GRACE_SECONDS = int(os.environ.get("EAGLE_COPY_GRACE_SECONDS", "180"))
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".jxr", ".gif"}
 VIDEO_EXTS = {".webm", ".mp4", ".mkv", ".mov", ".avi"}
@@ -65,6 +67,36 @@ def mark_done(rel_path: str):
     # Flush state every 50 new entries
     if len(_state_done) % 50 == 0:
         _flush_state()
+
+def prune_empty_source_dirs(path: Path):
+    """Remove empty dirs up to SOURCE so _RECOVERED visibly drains over time."""
+    try:
+        cur = path
+        while cur != SOURCE and SOURCE in cur.parents:
+            cur.rmdir()
+            cur = cur.parent
+    except OSError:
+        pass
+
+def delete_source_after_import(src_s: str, rel: str):
+    if not DELETE_SOURCE_AFTER_IMPORT:
+        return
+    src = Path(src_s)
+    try:
+        src.unlink()
+        prune_empty_source_dirs(src.parent)
+        log.info(f"  Deleted source: {rel}")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"  Could not delete source {rel}: {e}")
+
+def deferred_tmp_cleanup(path: Path, label: str):
+    if not path.exists():
+        return
+    log.info(f"  Waiting {EAGLE_COPY_GRACE_SECONDS}s before cleaning {label} temp files (Eagle copy is async)")
+    time.sleep(EAGLE_COPY_GRACE_SECONDS)
+    shutil.rmtree(path, ignore_errors=True)
 
 def _flush_state():
     tmp = STATE_FILE.with_suffix(".tmp")
@@ -162,6 +194,25 @@ FOLDER_ALIASES = {
     "sofrubicon": "Armored Core VI",
     "demonsouls": "Demon's Souls",
     "demonssouls": "Demon's Souls",
+    "finjitunictys0ffscxatjj": "Tunic",
+    "dangan3win": "Danganronpa V3",
+    "dw9emp": "Dynasty Warriors 9 Empires",
+    "endlingwin64shipping": "Endling",
+    "flateyewin64": "Flat Eye",
+    "lis": "Life Is Strange",
+    "monsterhunterrisedemo": "Monster Hunter Rise",
+}
+
+WEAK_FOLDER_HINTS = {
+    "desktop",
+    "baseprofile",
+    "make",
+    "wingdk",
+    "saved",
+    "content",
+    "engine",
+    "binaries",
+    "intermediate",
 }
 
 EXTRA_PATTERNS = [
@@ -194,6 +245,15 @@ EXTRA_PATTERNS = [
 
 def normalize_game_label(game):
     return FOLDER_ALIASES.get(canon(game), game)
+
+def folder_hint_game(parts):
+    if len(parts) <= 1:
+        return None
+    hint = normalize_game_label(clean_game_name(parts[0]))
+    key = canon(hint)
+    if key in WEAK_FOLDER_HINTS:
+        return None
+    return hint
 
 def generic_classify(name, sort_classify):
     n = normalize_text(name)
@@ -256,7 +316,13 @@ def _convert_image(args):
             [_AVIFENC, "--min", "25", "--max", "25", "--speed", "10", "--jobs", "1",
              str(inp), dst_s],
             capture_output=True, timeout=180)
-        return r.returncode == 0 and dst.exists() and dst.stat().st_size > 0
+        ok = r.returncode == 0 and dst.exists() and dst.stat().st_size > 0
+        if ok:
+            try:
+                shutil.copystat(src, dst)
+            except Exception:
+                pass
+        return ok
 
     if ext in (".gif", ".webp", ".jxr"):
         tmp_png = dst.with_suffix(".tmp.png")
@@ -301,6 +367,10 @@ def _process_video(args):
              str(fp), str(avif_out)],
             capture_output=True, timeout=180)
         if r2.returncode == 0 and avif_out.exists() and avif_out.stat().st_size > 0:
+            try:
+                shutil.copystat(src, avif_out)
+            except Exception:
+                pass
             avif_items.append((str(avif_out), avif_out.stem))
         fp.unlink(missing_ok=True)
 
@@ -345,17 +415,12 @@ def phase_images(files, sort_classify):
     tmp_img = TMP_ROOT / "img"
 
     for f in files:
-        # If subfolder matches a game name directly, prefer it as hint
         parts = f.relative_to(SOURCE).parts
-        # First try the subfolder name as game hint
-        if len(parts) > 1:
-            subfolder_game = normalize_game_label(clean_game_name(parts[0]))
-            game = subfolder_game if subfolder_game != "_Unknown Recovered" else generic_classify(f.name, sort_classify)
-        else:
-            game = generic_classify(f.name, sort_classify)
+        game = generic_classify(f.name, sort_classify)
+        if game == "_Unknown Recovered":
+            game = folder_hint_game(parts) or game
 
         stem = safe_stem(f)
-        folder_id = get_or_create_folder(game)
         tmp_dir = tmp_img / canon(game)
         tmp_dir.mkdir(parents=True, exist_ok=True)
         avif_dst = tmp_dir / f"{stem}.avif"
@@ -364,7 +429,7 @@ def phase_images(files, sort_classify):
             i += 1
             avif_dst = tmp_dir / f"{stem}_{i}.avif"
         used_dsts.add(str(avif_dst))
-        src_meta[str(f)] = (str(avif_dst), folder_id, str(f.relative_to(SOURCE)))
+        src_meta[str(f)] = (str(avif_dst), game, str(f.relative_to(SOURCE)))
 
     all_jobs = [(src, avif) for src, (avif, _, _) in src_meta.items()]
     ok_count = fail_count = 0
@@ -381,9 +446,9 @@ def phase_images(files, sort_classify):
                 continue
             if ok:
                 ok_count += 1
-                fid = src_meta[src_s][1]
+                game = src_meta[src_s][1]
                 rel = src_meta[src_s][2]
-                eagle_by_folder.setdefault(fid, []).append((dst_s, Path(dst_s).stem, rel))
+                eagle_by_folder.setdefault(game, []).append((dst_s, Path(dst_s).stem, rel, src_s))
             else:
                 log.warning(f"  AVIF fail: {Path(src_s).name}")
                 fail_count += 1
@@ -392,26 +457,21 @@ def phase_images(files, sort_classify):
 
     imported = 0
     BATCH = 200
-    for fid, items in eagle_by_folder.items():
+    for game, items in eagle_by_folder.items():
+        fid = get_or_create_folder(game)
         for i in range(0, len(items), BATCH):
             batch = items[i:i + BATCH]
             try:
-                r = eagle_add_items([(p, n) for p, n, _ in batch], fid)
+                r = eagle_add_items([(p, n) for p, n, _, _ in batch], fid)
                 log.info(f"  Eagle batch: {r.get('status')} ({len(batch)} items → {fid})")
                 imported += len(batch)
-                # Mark DONE in state (NTFS is read-only, never delete source)
-                for _, _, rel in batch:
+                for _, _, rel, src_s in batch:
                     mark_done(rel)
-                # Cleanup AVIF temp only
-                for avif_p, _, _ in batch:
-                    Path(avif_p).unlink(missing_ok=True)
+                    delete_source_after_import(src_s, rel)
             except Exception as e:
                 log.error(f"  Eagle import error: {e}")
-                for avif_p, _, _ in batch:
-                    Path(avif_p).unlink(missing_ok=True)
 
-    time.sleep(0.3)
-    shutil.rmtree(tmp_img, ignore_errors=True)
+    deferred_tmp_cleanup(tmp_img, "image")
     log.info(f"  Images: {imported} imported to Eagle")
 
 # ── Phase 2: Videos ───────────────────────────────────────────────────────────
@@ -424,11 +484,9 @@ def phase_videos(files, sort_classify):
     src_to_meta = {}
     for f in files:
         parts = f.relative_to(SOURCE).parts
-        if len(parts) > 1:
-            subfolder_game = normalize_game_label(clean_game_name(parts[0]))
-            game = subfolder_game if subfolder_game != "_Unknown Recovered" else generic_classify(f.name, sort_classify)
-        else:
-            game = generic_classify(f.name, sort_classify)
+        game = generic_classify(f.name, sort_classify)
+        if game == "_Unknown Recovered":
+            game = folder_hint_game(parts) or game
 
         folder_id = get_or_create_folder(game)
         stem = safe_stem(f)
@@ -478,11 +536,11 @@ def phase_videos(files, sort_classify):
             if all_ok:
                 ok_vids += 1
                 mark_done(rel)
+                delete_source_after_import(src_s, rel)
             else:
                 fail_vids += 1
 
-    time.sleep(0.3)
-    shutil.rmtree(TMP_ROOT / "vid", ignore_errors=True)
+    deferred_tmp_cleanup(TMP_ROOT / "vid", "video")
     log.info(f"  Videos: {ok_vids} OK ({total_frames} AVIF frames), {fail_vids} fail")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -492,6 +550,8 @@ def main():
     log.info(f" Source: {SOURCE}")
     log.info(f" Workers: {WORKERS}, CRF: 25, speed: 10, cap: {FRAMES_CAP} frames/video")
     log.info(f" State : {STATE_FILE}")
+    log.info(f" Delete source after import: {DELETE_SOURCE_AFTER_IMPORT}")
+    log.info(f" Eagle async temp cleanup grace: {EAGLE_COPY_GRACE_SECONDS}s")
     log.info("═" * 55)
 
     # Check source accessibility
